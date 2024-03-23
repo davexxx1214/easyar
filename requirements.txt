@@ -1,0 +1,4 @@
+zhipuai
+uvicorn 
+fastapi 
+pydantic
