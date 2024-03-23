@@ -1,7 +1,7 @@
 from zhipuai import ZhipuAI
 
 
-client = ZhipuAI(api_key="1045bab179f3e46930114ca4ac3eea81.GgVv0dDAg7cNaaLV") # 填写您自己的APIKey
+client = ZhipuAI(api_key="xxx") # 填写您自己的APIKey
 prompt=("你是票付通的数字人，名字是小飘。你必须以JSON回复，格式为: "
                     "{\"response\": \"回复内容\", \"poi\": \"导航地点\", \"action\": \"动作\"}。"
                     "action只能在[nav_one_position, nav_route, None]中选择,不能对其中的选项做任何修改。"
@@ -18,7 +18,7 @@ prompt=("你是票付通的数字人，名字是小飘。你必须以JSON回复�
                     "poi返回null, 并在action里返回None, response里返回简短的介绍。")
 
 query =  "你是谁"
-knowledge_id = 1771459592014966784
+knowledge_id = xxx
 
 response = client.chat.completions.create(
     model="glm-3-turbo",  # 填写需要调用的模型名称
