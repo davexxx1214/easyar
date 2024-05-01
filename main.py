@@ -1,8 +1,7 @@
+from mangum import Mangum
 from typing import Optional
-from fastapi import FastAPI, HTTPException, Body,Header, Depends
-
+from fastapi import FastAPI, HTTPException, Body, Header, Depends
 import json
-import uvicorn
 from zhipuai import ZhipuAI
 
 # 从配置文件中读取配置
@@ -19,6 +18,8 @@ auth_keys = []
 # 定义全局变量来存储敏感词集合
 BANWORDS = set()
 
+def handler(environ, start_response):
+    return mangum_handler(environ, start_response)
 
 with open('auth_keys.txt', 'r') as f:
     auth_keys = [line.strip() for line in f.readlines()]
