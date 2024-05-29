@@ -7,8 +7,6 @@ from zoneinfo import ZoneInfo
 
 app = Flask(__name__)
 
-default_prompt = "你的名字叫小关，你是中国云南大理石门关景区的智能客服，旨在回答并解决人们关于石门关景区相关的问题。你需要用简短的语言回答用户的问题。你必须用纯文本回复，不能使用带*的markdown格式。"
-
 # 定义全局变量来存储敏感词集合
 BANWORDS = set()
 
@@ -21,13 +19,15 @@ except Exception as e:
     raise e
 
 # 从config.json文件中读取配置信息
-with open('config.json', 'r') as config_file:
+with open('config.json', 'r',encoding='utf-8') as config_file:
     config = json.load(config_file)
     
 # 从配置信息中提取特定配置并赋值给变量
 api_key = config['api_key']
 knowledge_id = config['knowledge_id']
 auth_keys = config['auth_keys']
+default_prompt = config['default_prompt']
+nav_prompt = config['nav_prompt']
 
 # 使用配置信息初始化ZhipuAI的客户端
 client = ZhipuAI(api_key=api_key)
@@ -59,10 +59,9 @@ def query_endpoint():
         return jsonify({'detail': 'Missing query parameter'}), 400
     
     # 解析请求体中的数据
-    model = data.get('model', 'glm-4')
+    model = data.get('model', 'glm-3-turbo')
     prompt = default_prompt
     query = data.get('query', None)
-    stream = data.get('stream', False)
     
     # 检查查询是否包含敏感词
     if any(banword in query for banword in BANWORDS):
@@ -98,7 +97,46 @@ def query_endpoint():
                     }
                 }
             ],
-            stream=stream,
+        )
+        # 假设response.choices[0].message.content返回有效答案
+        anwser = response.choices[0].message.content
+        print(anwser)
+        return jsonify(anwser)
+    except Exception as e:
+        return jsonify({'detail': str(e)}), 500
+    
+@app.route('/nav', methods=['POST'])
+def query_nav_endpoint():
+    # 获取请求头中的授权key
+    auth_key = request.headers.get('auth-key')
+
+    if not valid_auth_key(auth_key):
+        return jsonify({'detail': 'Invalid key'}), 401
+
+    # 获取请求体的JSON数据
+    data = request.get_json()
+    print(data)
+    if not data or 'query' not in data:
+        return jsonify({'detail': 'Missing query parameter'}), 400
+    
+    # 解析请求体中的数据
+    model = data.get('model', 'glm-3-turbo')
+    prompt = nav_prompt
+    query = data.get('query', None)
+    
+    # 检查查询是否包含敏感词
+    if any(banword in query for banword in BANWORDS):
+        print("检测到敏感词，直接返回!")
+        return jsonify("NEEDNAV:N,POI:NONE")
+    
+    # 假设client.chat.completions.create是有效的调用代码
+    try:
+        response = client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": prompt},
+                {"role": "user", "content": query}
+            ]
         )
         # 假设response.choices[0].message.content返回有效答案
         anwser = response.choices[0].message.content

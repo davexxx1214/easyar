@@ -70,6 +70,7 @@ def query_endpoint():
     # 获取当前有效的配置
     config_name = data.get('config', 'default')
     config = get_config(config_name)
+    print(f'config  = {config_name}')
     if config is None:
         return jsonify({'detail': 'Config name not found'}), 404
 
@@ -77,9 +78,12 @@ def query_endpoint():
     model = data.get('model', config['model'])
     query = data['query']
     stream = data.get('stream', False)
+    print(f'query = {query}')
+    print(f'stream = {stream}')
 
     # 检查查询是否包含敏感词
     if any(banword in query for banword in BANWORDS):
+        print(f'检测到敏感词')
         return jsonify("对不起，我无法回答这个问题。")
 
     # 创建消息列表和工具配置
@@ -119,6 +123,7 @@ def query_endpoint():
                 tools=tools_list,
             )
             answer = response.choices[0].message.content
+            print(f'answer = {answer}')
             return jsonify(answer)
         else:
             # 对于流请求，返回生成器的输出。
