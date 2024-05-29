@@ -1,4 +1,4 @@
-from flask import Flask, Response, stream_with_context, jsonify, request
+from flask import Flask, Response, stream_with_context, request
 from zhipuai import ZhipuAI
 import json
 
@@ -60,19 +60,19 @@ def query_endpoint():
     auth_key = request.headers.get('auth-key')
 
     if not valid_auth_key(auth_key):
-        return jsonify({'detail': 'Invalid key'}), 401
+        return {'detail': 'Invalid key'}, 401
 
     # 获取请求体的JSON数据
     data = request.get_json()
     if not data or 'query' not in data:
-        return jsonify({'detail': 'Missing query parameter'}), 400
+        return {'detail': 'Missing query parameter'}, 400
 
     # 获取当前有效的配置
     config_name = data.get('config', 'default')
     config = get_config(config_name)
     print(f'config  = {config_name}')
     if config is None:
-        return jsonify({'detail': 'Config name not found'}), 404
+        return {'detail': 'Config name not found'}, 404
 
     # 设置模型和查询
     model = data.get('model', config['model'])
@@ -84,7 +84,7 @@ def query_endpoint():
     # 检查查询是否包含敏感词
     if any(banword in query for banword in BANWORDS):
         print(f'检测到敏感词')
-        return jsonify("对不起，我无法回答这个问题。")
+        return "对不起，我无法回答这个问题。"
 
     # 创建消息列表和工具配置
     messages = [
@@ -124,12 +124,12 @@ def query_endpoint():
             )
             answer = response.choices[0].message.content
             print(f'answer = {answer}')
-            return jsonify(answer)
+            return answer
         else:
             # 对于流请求，返回生成器的输出。
             return Response(stream_with_context(generate()), content_type='text/event-stream')
     except Exception as e:
-        return jsonify({'detail': str(e)}), 500
+        return {'detail': str(e)}, 500
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=9000)
