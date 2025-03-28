@@ -88,7 +88,6 @@ def contains_banned_words(query):
     return any(banword in query for banword in BANWORDS)
 
 def call_coze_stream(bot_id: str, query: str, api_key: str):
-    # ... (headers and payload definition remain the same) ...
     headers = {
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
@@ -114,18 +113,17 @@ def call_coze_stream(bot_id: str, query: str, api_key: str):
         response.raise_for_status() # 检查 HTTP 错误状态码 (4xx, 5xx)
 
         current_event = None
-        accumulated_reasoning = ""  # Store reasoning steps
-        answer_started = False      # Flag to track if the main answer has started
-        reasoning_yielded = False   # Flag to ensure reasoning is yielded only once
+        accumulated_reasoning = ""  # 用于积累所有思考过程
+        answer_started = False      # 标记答案是否开始
+        reasoning_started = False   # 标记思考过程是否已开始
+        reasoning_ended = False     # 标记思考过程是否已结束
 
         print(f"\n--- Response stream from bot {bot_id} ---")
-        # print("DEBUG: Before iterating response lines...")
         lines_iterated = 0
         for line in response.iter_lines():
             lines_iterated += 1
             if line:
                 decoded_line = line.decode('utf-8')
-                # print(f"DEBUG: Raw SSE line: {decoded_line}")
 
                 if decoded_line.startswith("event:"):
                     current_event = decoded_line[len("event:"):].strip()
@@ -133,12 +131,11 @@ def call_coze_stream(bot_id: str, query: str, api_key: str):
                     data_str = decoded_line[len("data:"):].strip()
 
                     if data_str == "[DONE]":
-                        # --- Handle case where only reasoning was sent ---
-                        if not answer_started and accumulated_reasoning and not reasoning_yielded:
-                            print(f"<think>{accumulated_reasoning}</think>\n", end='', flush=True) # Print reasoning before exiting
-                            yield f"<think>{accumulated_reasoning}</think>\n"
-                            reasoning_yielded = True
-                        # --- End of handling ---
+                        # 如果流结束且思考过程已开始但未结束，关闭思考标签
+                        if reasoning_started and not reasoning_ended:
+                            print("</think>", end='', flush=True)
+                            yield "</think>"
+                            reasoning_ended = True
                         print(f"\n--- End of stream from bot {bot_id} ---")
                         print(f"INFO: Coze stream finished for bot {bot_id}.")
                         break # 流正常结束
@@ -152,28 +149,33 @@ def call_coze_stream(bot_id: str, query: str, api_key: str):
                             content_part = data.get("content", "")
                             reasoning_content = data.get("reasoning_content") # Get reasoning content
 
-                            # 1. Accumulate reasoning before the answer starts
-                            if reasoning_content and not answer_started:
-                                if accumulated_reasoning: # Add newline between steps
-                                    accumulated_reasoning += "\n"
+                            # 处理思考过程
+                            if reasoning_content:
+                                # 如果是第一个思考片段，输出开始标签
+                                if not reasoning_started:
+                                    print("<think>", end='', flush=True)
+                                    yield "<think>"
+                                    reasoning_started = True
+                                
+                                # 积累并输出思考内容
                                 accumulated_reasoning += reasoning_content
+                                print(f"{reasoning_content}", end='', flush=True)
+                                yield reasoning_content
 
-                            # 2. Check if the answer is starting
+                            # 当答案开始时，如果思考过程已开始但未结束，关闭思考标签
                             if role == "assistant" and msg_type == "answer" and content_part:
-                                # 3. If answer starts and reasoning hasn't been yielded, yield it now.
-                                if not answer_started and accumulated_reasoning and not reasoning_yielded:
-                                    print(f"<think>{accumulated_reasoning}</think>\n", end='', flush=True) # Print reasoning
-                                    yield f"<think>{accumulated_reasoning}</think>\n"
-                                    reasoning_yielded = True
-                                    accumulated_reasoning = "" # Clear after yielding
-
-                                answer_started = True # Mark that the answer has begun
-
-                                # 4. Yield the actual answer content part
-                                print(content_part, end='', flush=True) # Print answer part
+                                if reasoning_started and not reasoning_ended:
+                                    print("</think>", end='', flush=True)
+                                    yield "</think>"
+                                    reasoning_ended = True
+                                
+                                # 标记答案已开始并输出答案内容
+                                if not answer_started:
+                                    answer_started = True
+                                print(content_part, end='', flush=True)
                                 yield content_part
 
-                        # Handle Coze error event (unchanged)
+                        # Handle Coze error event
                         elif current_event == "error":
                             error_message = data.get('error', {}).get('message', 'Unknown Coze API error')
                             error_code = data.get('error', {}).get('code', 'N/A')
@@ -187,12 +189,8 @@ def call_coze_stream(bot_id: str, query: str, api_key: str):
                     except Exception as e:
                          print(f"\nERROR: Error processing Coze data chunk: {e}, data: {data_str}")
                          continue
-            # else:
-                # print("DEBUG: Received empty line.")
-        # print(f"DEBUG: After iterating response lines. Total lines iterated: {lines_iterated}")
         print() # Final newline for console clarity
 
-    # ... (except blocks remain the same) ...
     except requests.exceptions.Timeout as e:
         print(f"ERROR: Request to Coze API timed out for bot {bot_id}: {e}")
         yield "[ERROR: Request to Coze API timed out]"
@@ -206,7 +204,6 @@ def call_coze_stream(bot_id: str, query: str, api_key: str):
         import traceback
         print(f"ERROR: Unexpected error during Coze stream processing for bot {bot_id}: {e}\n{traceback.format_exc()}")
         yield f"[ERROR: Internal server error during stream processing]"
-# --- API 端点 ---
 
 @app.route('/fast', methods=['POST'])
 def fast_endpoint():
@@ -247,8 +244,14 @@ def fast_endpoint():
 
     print(f"INFO: Calling fast bot ({bot_id}) for {request.remote_addr}. Query: '{query[:50]}...'") # Changed from app.logger.info
     generator = call_coze_stream(bot_id, query, api_key)
+    headers = {
+        'Cache-Control': 'no-cache',
+        'X-Accel-Buffering': 'no'  # 禁用Nginx缓冲
+    }
     # 使用 text/event-stream 类型返回 SSE 流
-    return Response(stream_with_context(generator), content_type='text/event-stream')
+    return Response(stream_with_context(generator), 
+                   content_type='text/event-stream',
+                   headers=headers)
 
 
 @app.route('/thinking', methods=['POST'])
@@ -286,7 +289,13 @@ def thinking_endpoint():
 
     print(f"INFO: Calling thinking bot ({bot_id}) for {request.remote_addr}. Query: '{query[:50]}...'") # Changed from app.logger.info
     generator = call_coze_stream(bot_id, query, api_key)
-    return Response(stream_with_context(generator), content_type='text/event-stream')
+    headers = {
+        'Cache-Control': 'no-cache',
+        'X-Accel-Buffering': 'no'  # 禁用Nginx缓冲
+    }
+    return Response(stream_with_context(generator), 
+                   content_type='text/event-stream',
+                   headers=headers)
 
 # --- 启动服务 ---
 if __name__ == '__main__':
