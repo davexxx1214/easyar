@@ -2,7 +2,13 @@
 from flask import Flask, Response, stream_with_context, request
 import json
 import requests
-import os # 保留 os 用于文件检查
+import os 
+import traceback
+import sys 
+import logging
+
+# 设置 werkzeug 日志级别，减少请求日志
+logging.getLogger('werkzeug').setLevel(logging.WARNING)
 
 app = Flask(__name__)
 
@@ -24,20 +30,20 @@ def load_config():
                 if key not in CONFIG:
                     raise ValueError(f"Config file 'config.json' is missing required key: {key}")
             if not isinstance(CONFIG.get('auth_keys'), list):
-                 raise ValueError(f"Config key 'auth_keys' must be a list")
-            print("INFO: Configuration loaded successfully.") # Changed from app.logger.info
+                 raise ValueError("Config key 'auth_keys' must be a list")
+            print("INFO: Configuration loaded successfully.", file=sys.stderr)
 
     except FileNotFoundError:
-        print("ERROR: Config file 'config.json' not found.") # Changed from app.logger.error
+        print("ERROR: Config file 'config.json' not found.", file=sys.stderr)
         raise
     except json.JSONDecodeError:
-        print("ERROR: Error decoding 'config.json'. Make sure it's valid JSON.") # Changed from app.logger.error
+        print("ERROR: Error decoding 'config.json'. Make sure it's valid JSON.", file=sys.stderr)
         raise
     except ValueError as ve:
-        print(f"ERROR: {str(ve)}") # Changed from app.logger.error
+        print(f"ERROR: {str(ve)}", file=sys.stderr)
         raise
     except Exception as e:
-        print(f"ERROR: Failed to load config: {str(e)}") # Changed from app.logger.error
+        print(f"ERROR: Failed to load config: {str(e)}", file=sys.stderr)
         raise
 
 # 加载敏感词
@@ -47,27 +53,25 @@ def load_banwords():
     try:
         # 检查 banwords.txt 是否存在
         if not os.path.exists('banwords.txt'):
-             print("WARNING: Banwords file 'banwords.txt' not found. No banwords will be loaded.") # Changed from app.logger.warning
+             print("WARNING: Banwords file 'banwords.txt' not found. No banwords will be loaded.", file=sys.stderr)
              BANWORDS = set()
              return
 
         with open('banwords.txt', 'r', encoding='utf-8') as file:
             BANWORDS = {line.strip() for line in file if line.strip()}
-        print(f"INFO: Loaded {len(BANWORDS)} banwords.") # Changed from app.logger.info
+        print(f"INFO: Loaded {len(BANWORDS)} banwords.", file=sys.stderr)
     except Exception as e:
-        print(f"ERROR: Failed to load banned words list: {str(e)}") # Changed from app.logger.error
-        # 选择是继续运行（没有敏感词过滤）还是抛出错误停止服务
-        # 这里选择继续运行，但记录错误
+        print(f"ERROR: Failed to load banned words list: {str(e)}", file=sys.stderr)
+        # 选择是继续运行（没有敏感词过滤）而不是抛出错误停止服务
         BANWORDS = set() # 确保 BANWORDS 是一个集合
 
 # 初始化数据
 try:
     load_config()
-    load_banwords() # Corrected: load_banwords should be inside the try block if its failure should stop the app
+    load_banwords()
 except Exception as e:
-    # 如果初始化失败，可以选择退出程序或进行其他处理
-    print(f"CRITICAL: Initialization failed due to: {e}. Application will exit.") # Changed from app.logger.critical
-    # 在生产环境中可能需要更优雅的退出方式
+    # 如果初始化失败，退出程序
+    print(f"CRITICAL: Initialization failed due to: {e}. Application will exit.", file=sys.stderr)
     exit(1) # 关键配置或文件加载失败，直接退出
 
 
@@ -88,6 +92,7 @@ def contains_banned_words(query):
     return any(banword in query for banword in BANWORDS)
 
 def call_coze_stream(bot_id: str, query: str, api_key: str):
+    """调用 Coze API 并返回流式响应"""
     headers = {
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
@@ -95,9 +100,9 @@ def call_coze_stream(bot_id: str, query: str, api_key: str):
     }
     payload = {
         "bot_id": bot_id,
-        "user_id": "api_user", # 使用固定的 user_id
+        "user_id": "api_user",
         "stream": True,
-        "auto_save_history": False, # API 调用通常不需要保存历史
+        "auto_save_history": False,
         "additional_messages": [
             {
                 "role": "user",
@@ -108,20 +113,16 @@ def call_coze_stream(bot_id: str, query: str, api_key: str):
     }
 
     try:
-        # 增加超时设置 (connect_timeout, read_timeout)
         response = requests.post(COZE_API_URL, headers=headers, json=payload, stream=True, timeout=(10, 60))
-        response.raise_for_status() # 检查 HTTP 错误状态码 (4xx, 5xx)
+        response.raise_for_status()
 
         current_event = None
-        accumulated_reasoning = ""  # 用于积累所有思考过程
-        answer_started = False      # 标记答案是否开始
-        reasoning_started = False   # 标记思考过程是否已开始
-        reasoning_ended = False     # 标记思考过程是否已结束
+        answer_started = False
+        reasoning_started = False
+        reasoning_ended = False
 
-        print(f"\n--- Response stream from bot {bot_id} ---")
-        lines_iterated = 0
+        print(f"\n--- Response stream from bot {bot_id} ---", file=sys.stderr)
         for line in response.iter_lines():
-            lines_iterated += 1
             if line:
                 decoded_line = line.decode('utf-8')
 
@@ -131,79 +132,71 @@ def call_coze_stream(bot_id: str, query: str, api_key: str):
                     data_str = decoded_line[len("data:"):].strip()
 
                     if data_str == "[DONE]":
-                        # 如果流结束且思考过程已开始但未结束，关闭思考标签
                         if reasoning_started and not reasoning_ended:
-                            print("</think>", end='', flush=True)
+                            print("</think>", file=sys.stderr)
                             yield "</think>"
                             reasoning_ended = True
-                        print(f"\n--- End of stream from bot {bot_id} ---")
-                        print(f"INFO: Coze stream finished for bot {bot_id}.")
-                        break # 流正常结束
+                        print(f"\n--- End of stream from bot {bot_id} ---", file=sys.stderr)
+                        print(f"INFO: Coze stream finished for bot {bot_id}.", file=sys.stderr)
+                        break
 
                     try:
                         data = json.loads(data_str)
 
                         if current_event == "conversation.message.delta":
                             role = data.get("role")
-                            msg_type = data.get("type") # Renamed from 'type' to avoid conflict
+                            msg_type = data.get("type")
                             content_part = data.get("content", "")
-                            reasoning_content = data.get("reasoning_content") # Get reasoning content
+                            reasoning_content = data.get("reasoning_content")
 
-                            # 处理思考过程
                             if reasoning_content:
-                                # 如果是第一个思考片段，输出开始标签
                                 if not reasoning_started:
-                                    print("<think>", end='', flush=True)
+                                    print("<think>", file=sys.stderr)
                                     yield "<think>"
                                     reasoning_started = True
                                 
-                                # 积累并输出思考内容
-                                accumulated_reasoning += reasoning_content
-                                print(f"{reasoning_content}", end='', flush=True)
+                                print(f"{reasoning_content}", file=sys.stderr)
                                 yield reasoning_content
 
-                            # 当答案开始时，如果思考过程已开始但未结束，关闭思考标签
                             if role == "assistant" and msg_type == "answer" and content_part:
                                 if reasoning_started and not reasoning_ended:
-                                    print("</think>", end='', flush=True)
+                                    print("</think>", file=sys.stderr)
                                     yield "</think>"
                                     reasoning_ended = True
                                 
-                                # 标记答案已开始并输出答案内容
                                 if not answer_started:
                                     answer_started = True
-                                print(content_part, end='', flush=True)
+                                print(content_part, file=sys.stderr)
                                 yield content_part
 
-                        # Handle Coze error event
                         elif current_event == "error":
                             error_message = data.get('error', {}).get('message', 'Unknown Coze API error')
                             error_code = data.get('error', {}).get('code', 'N/A')
-                            print(f"\nERROR: Coze API Error Event received: Code={error_code}, Message={error_message}")
+                            print(f"\nERROR: Coze API Error Event received: Code={error_code}, Message={error_message}", file=sys.stderr)
                             yield f"[ERROR: Coze API Error - {error_message}]"
                             break
 
                     except json.JSONDecodeError:
-                        print(f"\nWARNING: Could not decode JSON from Coze data line: {data_str}")
+                        print(f"\nWARNING: Could not decode JSON from Coze data line: {data_str}", file=sys.stderr)
                         continue
                     except Exception as e:
-                         print(f"\nERROR: Error processing Coze data chunk: {e}, data: {data_str}")
+                         print(f"\nERROR: Error processing Coze data chunk: {e}, data: {data_str}", file=sys.stderr)
                          continue
-        print() # Final newline for console clarity
+        print("", file=sys.stderr)
 
     except requests.exceptions.Timeout as e:
-        print(f"ERROR: Request to Coze API timed out for bot {bot_id}: {e}")
+        print(f"ERROR: Request to Coze API timed out for bot {bot_id}: {e}", file=sys.stderr)
         yield "[ERROR: Request to Coze API timed out]"
     except requests.exceptions.HTTPError as e:
-        print(f"ERROR: Coze API returned HTTP error for bot {bot_id}: {e.response.status_code} {e.response.reason}. Response: {e.response.text}")
+        print(f"ERROR: Coze API returned HTTP error for bot {bot_id}: {e.response.status_code} {e.response.reason}. Response: {e.response.text}", file=sys.stderr)
         yield f"[ERROR: Coze API request failed - HTTP {e.response.status_code}]"
     except requests.exceptions.RequestException as e:
-        print(f"ERROR: Network error connecting to Coze API for bot {bot_id}: {e}")
+        print(f"ERROR: Network error connecting to Coze API for bot {bot_id}: {e}", file=sys.stderr)
         yield f"[ERROR: Failed to connect to Coze API - {e}]"
     except Exception as e:
-        import traceback
-        print(f"ERROR: Unexpected error during Coze stream processing for bot {bot_id}: {e}\n{traceback.format_exc()}")
+        print(f"ERROR: Unexpected error during Coze stream processing for bot {bot_id}: {e}\n{traceback.format_exc()}", file=sys.stderr)
         yield f"[ERROR: Internal server error during stream processing]"
+
 
 @app.route('/fast', methods=['POST'])
 def fast_endpoint():
@@ -211,38 +204,36 @@ def fast_endpoint():
     # 1. 认证
     auth_key = request.headers.get('auth-key')
     if not valid_auth_key(auth_key):
-        print(f"WARNING: Invalid auth key received from {request.remote_addr}.") # Changed from app.logger.warning
+        print(f"WARNING: Invalid auth key received from {request.remote_addr}.", file=sys.stderr)
         # 返回 JSON 错误和 401 状态码
         return {"error": CONFIG.get('rejection_message', "Unauthorized access")}, 401
 
     # 2. 获取 Query (确保是 JSON 请求)
     if not request.is_json:
-        print("ERROR: Request content type is not application/json.") # Changed from app.logger.error
+        print("ERROR: Request content type is not application/json.", file=sys.stderr)
         return {"error": "Request must be JSON"}, 415 # Unsupported Media Type
 
     data = request.get_json()
     if not data or 'query' not in data or not isinstance(data['query'], str):
-        print("ERROR: Missing or invalid 'query' parameter in JSON request.") # Changed from app.logger.error
+        print("ERROR: Missing or invalid 'query' parameter in JSON request.", file=sys.stderr)
         return {"error": "Missing or invalid 'query' parameter"}, 400 # Bad Request
     query = data['query']
 
     # 3. 敏感词检查
     if contains_banned_words(query):
-        print(f"INFO: Banned word detected in query from {request.remote_addr}. Query: '{query[:50]}...'") # Changed from app.logger.info
+        print(f"INFO: Banned word detected in query from {request.remote_addr}. Query: '{query[:50]}...'", file=sys.stderr)
         # 返回纯文本拒绝消息 和 200 OK (按原设计)
-        # 注意：这里返回 200 可能不是最佳实践，但遵循了原始代码行为
         return Response(CONFIG.get('rejection_message', "Query contains restricted content."), mimetype='text/plain', status=200)
-
 
     # 4. 调用 Coze 并流式返回
     bot_id = CONFIG.get('fast_bot_id')
     api_key = CONFIG.get('coze_key')
 
     if not bot_id or not api_key:
-         print("ERROR: Server configuration error: 'fast_bot_id' or 'coze_key' is missing.") # Changed from app.logger.error
+         print("ERROR: Server configuration error: 'fast_bot_id' or 'coze_key' is missing.", file=sys.stderr)
          return {"error": "Server configuration error"}, 500 # Internal Server Error
 
-    print(f"INFO: Calling fast bot ({bot_id}) for {request.remote_addr}. Query: '{query[:50]}...'") # Changed from app.logger.info
+    print(f"INFO: Calling fast bot ({bot_id}) for {request.remote_addr}. Query: '{query[:50]}...'", file=sys.stderr)
     generator = call_coze_stream(bot_id, query, api_key)
     headers = {
         'Cache-Control': 'no-cache',
@@ -253,30 +244,29 @@ def fast_endpoint():
                    content_type='text/event-stream',
                    headers=headers)
 
-
 @app.route('/thinking', methods=['POST'])
 def thinking_endpoint():
     """Coze 深度思考 Bot 接口 (流式)"""
      # 1. 认证
     auth_key = request.headers.get('auth-key')
     if not valid_auth_key(auth_key):
-        print(f"WARNING: Invalid auth key received from {request.remote_addr}.") # Changed from app.logger.warning
+        print(f"WARNING: Invalid auth key received from {request.remote_addr}.", file=sys.stderr)
         return {"error": CONFIG.get('rejection_message', "Unauthorized access")}, 401
 
     # 2. 获取 Query
     if not request.is_json:
-        print("ERROR: Request content type is not application/json.") # Changed from app.logger.error
+        print("ERROR: Request content type is not application/json.", file=sys.stderr)
         return {"error": "Request must be JSON"}, 415
 
     data = request.get_json()
     if not data or 'query' not in data or not isinstance(data['query'], str):
-        print("ERROR: Missing or invalid 'query' parameter in JSON request.") # Changed from app.logger.error
+        print("ERROR: Missing or invalid 'query' parameter in JSON request.", file=sys.stderr)
         return {"error": "Missing or invalid 'query' parameter"}, 400
     query = data['query']
 
     # 3. 敏感词检查
     if contains_banned_words(query):
-        print(f"INFO: Banned word detected in query from {request.remote_addr}. Query: '{query[:50]}...'") # Changed from app.logger.info
+        print(f"INFO: Banned word detected in query from {request.remote_addr}. Query: '{query[:50]}...'", file=sys.stderr)
         return Response(CONFIG.get('rejection_message', "Query contains restricted content."), mimetype='text/plain', status=200)
 
     # 4. 调用 Coze 并流式返回
@@ -284,10 +274,10 @@ def thinking_endpoint():
     api_key = CONFIG.get('coze_key')
 
     if not bot_id or not api_key:
-        print("ERROR: Server configuration error: 'thinking_bot_id' or 'coze_key' is missing.") # Changed from app.logger.error
+        print("ERROR: Server configuration error: 'thinking_bot_id' or 'coze_key' is missing.", file=sys.stderr)
         return {"error": "Server configuration error"}, 500
 
-    print(f"INFO: Calling thinking bot ({bot_id}) for {request.remote_addr}. Query: '{query[:50]}...'") # Changed from app.logger.info
+    print(f"INFO: Calling thinking bot ({bot_id}) for {request.remote_addr}. Query: '{query[:50]}...'", file=sys.stderr)
     generator = call_coze_stream(bot_id, query, api_key)
     headers = {
         'Cache-Control': 'no-cache',
@@ -305,5 +295,5 @@ if __name__ == '__main__':
     # 例如: waitress-serve --host=0.0.0.0 --port=9000 coze.main:app
     # 这里仍然使用 Flask 自带服务器，但关闭 debug 模式
     # 添加一个启动信息
-    print(f"INFO: Starting Flask server on host 0.0.0.0, port {port}...")
+    print(f"INFO: Starting Flask server on host 0.0.0.0, port {port}...", file=sys.stderr)
     app.run(host='0.0.0.0', port=port, debug=False)
