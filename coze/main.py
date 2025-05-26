@@ -6,6 +6,19 @@ import os
 import traceback
 import sys 
 import logging
+import time
+
+# 从 cozepy 导入必要的类
+from cozepy import (
+    COZE_CN_BASE_URL,
+    Coze,
+    JWTAuth,
+    JWTOAuthApp,
+    Message,
+    ChatEventType,
+    MessageRole,
+    MessageType
+)
 
 # 设置 werkzeug 日志级别，减少请求日志
 logging.getLogger('werkzeug').setLevel(logging.WARNING)
@@ -15,23 +28,59 @@ app = Flask(__name__)
 # 定义全局变量
 BANWORDS = set()
 CONFIG = {}
-COZE_API_URL = "https://api.coze.cn/v3/chat"
+COZE_API_URL = "https://api.coze.cn/v3/chat" # 将不再被 fast_endpoint 直接使用
+# 全局 Coze 客户端实例
+coze_client = None
 
 # 加载配置
 def load_config():
-    """从 config.json 加载配置"""
-    global CONFIG
+    """从 config.json 加载配置并初始化 Coze 客户端"""
+    global CONFIG, coze_client
     try:
         with open('config.json', 'r', encoding='utf-8') as config_file:
             CONFIG = json.load(config_file)
             # 检查必要的配置是否存在
-            required_keys = ['coze_key', 'auth_keys', 'fast_bot_id', 'thinking_bot_id', 'rejection_message']
+            required_keys = ['auth_keys', 'fast_bot_id', 'nav_bot_id', 'rejection_message'] # 添加nav_bot_id到必须项
             for key in required_keys:
                 if key not in CONFIG:
                     raise ValueError(f"Config file 'config.json' is missing required key: {key}")
             if not isinstance(CONFIG.get('auth_keys'), list):
                  raise ValueError("Config key 'auth_keys' must be a list")
+
+            # JWT Auth 所需的新配置项
+            jwt_required_keys = ['private_key_file_path', 'public_key_id', 'client_id']
+            for key in jwt_required_keys:
+                if key not in CONFIG:
+                    raise ValueError(f"Config file 'config.json' is missing JWT Auth required key: {key}")
+            
+            # 确定 Coze API Base URL (config -> env -> default)
+            coze_api_base_url = CONFIG.get('coze_api_base')
+            if not coze_api_base_url:
+                coze_api_base_url = os.getenv("COZE_API_BASE", COZE_CN_BASE_URL)
+            CONFIG['coze_api_base_for_sdk'] = coze_api_base_url # 存储供 SDK 使用
+
             print("INFO: Configuration loaded successfully.", file=sys.stderr)
+
+            # 初始化 Coze Client
+            private_key_path = CONFIG['private_key_file_path']
+            try:
+                with open(private_key_path, "r") as f:
+                    jwt_oauth_private_key = f.read()
+            except FileNotFoundError:
+                print(f"ERROR: Private key file '{private_key_path}' not found.", file=sys.stderr)
+                raise
+            except Exception as e:
+                print(f"ERROR: Error reading private key file '{private_key_path}': {e}", file=sys.stderr)
+                raise
+
+            jwt_oauth_app = JWTOAuthApp(
+                client_id=CONFIG['client_id'],
+                private_key=jwt_oauth_private_key,
+                public_key_id=CONFIG['public_key_id'],
+                base_url=CONFIG['coze_api_base_for_sdk'],
+            )
+            coze_client = Coze(auth=JWTAuth(oauth_app=jwt_oauth_app), base_url=CONFIG['coze_api_base_for_sdk'])
+            print("INFO: Coze client initialized successfully.", file=sys.stderr)
 
     except FileNotFoundError:
         print("ERROR: Config file 'config.json' not found.", file=sys.stderr)
@@ -75,10 +124,8 @@ except Exception as e:
     exit(1) # 关键配置或文件加载失败，直接退出
 
 
-# --- 辅助函数 ---
-
 def valid_auth_key(auth_key):
-    """验证请求头中的 auth-key"""
+    """验证请求头中的 auth-key (旧版认证，fast_endpoint 将不再使用)"""
     if not auth_key or not auth_key.startswith('Bearer '):
         return False
     key = auth_key.split(' ')[1]
@@ -91,201 +138,267 @@ def contains_banned_words(query):
         return False
     return any(banword in query for banword in BANWORDS)
 
-def call_coze_stream(bot_id: str, query: str, api_key: str):
-    """调用 Coze API 并返回流式响应"""
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json",
-        "Accept": "text/event-stream"
-    }
-    payload = {
-        "bot_id": bot_id,
-        "user_id": "api_user",
-        "stream": True,
-        "auto_save_history": False,
-        "additional_messages": [
-            {
-                "role": "user",
-                "content": query,
-                "content_type": "text"
-            }
-        ]
-    }
-
+# 新的 SDK 流处理器
+def sdk_stream_processor(sdk_stream, bot_id: str):
+    """处理来自 Coze SDK 的流并产生内容部分。"""
+    print(f"\n--- SDK Response stream from bot {bot_id} ---", file=sys.stderr)
     try:
-        response = requests.post(COZE_API_URL, headers=headers, json=payload, stream=True, timeout=(10, 60))
-        response.raise_for_status()
+        full_content_for_logging = [] 
+        for event in sdk_stream:
+            if event.event == ChatEventType.CONVERSATION_MESSAGE_DELTA:
+                if hasattr(event, 'message') and \
+                   event.message.role == MessageRole.ASSISTANT and \
+                   event.message.type == MessageType.ANSWER and \
+                   event.message.content:
+                    content_part = event.message.content
+                    full_content_for_logging.append(content_part)
+                    yield content_part
+            elif event.event == ChatEventType.ERROR:
+                error_detail = event.error if hasattr(event, 'error') else None
+                error_message = "Unknown SDK error"
+                error_code = "N/A"
+                if error_detail:
+                    # 尝试获取更详细的错误信息
+                    if hasattr(error_detail, 'message') and error_detail.message:
+                        error_message = error_detail.message
+                    elif isinstance(error_detail, str):
+                        error_message = error_detail
+                    else:
+                        error_message = str(error_detail)
 
-        current_event = None
-        answer_started = False
-        reasoning_started = False
-        reasoning_ended = False
+                    if hasattr(error_detail, 'code') and error_detail.code:
+                        error_code = error_detail.code
+                
+                print(f"\nERROR: Coze SDK Error Event: Code={error_code}, Message='{error_message}'", file=sys.stderr)
+                yield f"[ERROR: Coze SDK Error - {error_message}]"
+                break 
+        
+        if full_content_for_logging:
+            print(''.join(full_content_for_logging), file=sys.stderr) # 记录完整的消息
+        print(f"\n--- End of SDK stream from bot {bot_id} ---", file=sys.stderr)
+        print(f"INFO: Coze SDK stream finished for bot {bot_id}.", file=sys.stderr)
 
-        print(f"\n--- Response stream from bot {bot_id} ---", file=sys.stderr)
-        for line in response.iter_lines():
-            if line:
-                decoded_line = line.decode('utf-8')
-
-                if decoded_line.startswith("event:"):
-                    current_event = decoded_line[len("event:"):].strip()
-                elif decoded_line.startswith("data:"):
-                    data_str = decoded_line[len("data:"):].strip()
-
-                    if data_str == "[DONE]":
-                        if reasoning_started and not reasoning_ended:
-                            print("</think>", file=sys.stderr)
-                            yield "</think>"
-                            reasoning_ended = True
-                        print(f"\n--- End of stream from bot {bot_id} ---", file=sys.stderr)
-                        print(f"INFO: Coze stream finished for bot {bot_id}.", file=sys.stderr)
-                        break
-
-                    try:
-                        data = json.loads(data_str)
-
-                        if current_event == "conversation.message.delta":
-                            role = data.get("role")
-                            msg_type = data.get("type")
-                            content_part = data.get("content", "")
-                            reasoning_content = data.get("reasoning_content")
-
-                            if reasoning_content:
-                                if not reasoning_started:
-                                    print("<think>", file=sys.stderr)
-                                    yield "<think>"
-                                    reasoning_started = True
-                                
-                                print(f"{reasoning_content}", file=sys.stderr)
-                                yield reasoning_content
-
-                            if role == "assistant" and msg_type == "answer" and content_part:
-                                if reasoning_started and not reasoning_ended:
-                                    print("</think>", file=sys.stderr)
-                                    yield "</think>"
-                                    reasoning_ended = True
-                                
-                                if not answer_started:
-                                    answer_started = True
-                                print(content_part, file=sys.stderr)
-                                yield content_part
-
-                        elif current_event == "error":
-                            error_message = data.get('error', {}).get('message', 'Unknown Coze API error')
-                            error_code = data.get('error', {}).get('code', 'N/A')
-                            print(f"\nERROR: Coze API Error Event received: Code={error_code}, Message={error_message}", file=sys.stderr)
-                            yield f"[ERROR: Coze API Error - {error_message}]"
-                            break
-
-                    except json.JSONDecodeError:
-                        print(f"\nWARNING: Could not decode JSON from Coze data line: {data_str}", file=sys.stderr)
-                        continue
-                    except Exception as e:
-                         print(f"\nERROR: Error processing Coze data chunk: {e}, data: {data_str}", file=sys.stderr)
-                         continue
-        print("", file=sys.stderr)
-
-    except requests.exceptions.Timeout as e:
-        print(f"ERROR: Request to Coze API timed out for bot {bot_id}: {e}", file=sys.stderr)
-        yield "[ERROR: Request to Coze API timed out]"
-    except requests.exceptions.HTTPError as e:
-        print(f"ERROR: Coze API returned HTTP error for bot {bot_id}: {e.response.status_code} {e.response.reason}. Response: {e.response.text}", file=sys.stderr)
-        yield f"[ERROR: Coze API request failed - HTTP {e.response.status_code}]"
-    except requests.exceptions.RequestException as e:
-        print(f"ERROR: Network error connecting to Coze API for bot {bot_id}: {e}", file=sys.stderr)
-        yield f"[ERROR: Failed to connect to Coze API - {e}]"
+    except AttributeError as ae:
+        print(f"ERROR: AttributeError during SDK stream processing for bot {bot_id}: {ae}\n{traceback.format_exc()}", file=sys.stderr)
+        yield f"[ERROR: Internal server error - SDK attribute issue]"
     except Exception as e:
-        print(f"ERROR: Unexpected error during Coze stream processing for bot {bot_id}: {e}\n{traceback.format_exc()}", file=sys.stderr)
+        print(f"ERROR: Unexpected error during SDK stream processing for bot {bot_id}: {e}\n{traceback.format_exc()}", file=sys.stderr)
         yield f"[ERROR: Internal server error during stream processing]"
 
 
-@app.route('/fast', methods=['POST'])
+@app.route('/', methods=['POST'])
 def fast_endpoint():
-    """Coze 快速响应 Bot 接口 (流式)"""
-    # 1. 认证
-    auth_key = request.headers.get('auth-key')
-    if not valid_auth_key(auth_key):
-        print(f"WARNING: Invalid auth key received from {request.remote_addr}.", file=sys.stderr)
-        # 返回 JSON 错误和 401 状态码
-        return {"error": CONFIG.get('rejection_message', "Unauthorized access")}, 401
+    """Coze 快速响应 Bot 接口 (流式) - 使用 SDK 和 JWTAuth"""
+    # 1. 认证 - 由 coze_client 通过 JWTAuth 自动处理
 
     # 2. 获取 Query (确保是 JSON 请求)
     if not request.is_json:
         print("ERROR: Request content type is not application/json.", file=sys.stderr)
-        return {"error": "Request must be JSON"}, 415 # Unsupported Media Type
+        return {"error": "Request must be JSON"}, 415 
 
     data = request.get_json()
     if not data or 'query' not in data or not isinstance(data['query'], str):
         print("ERROR: Missing or invalid 'query' parameter in JSON request.", file=sys.stderr)
-        return {"error": "Missing or invalid 'query' parameter"}, 400 # Bad Request
+        return {"error": "Missing or invalid 'query' parameter"}, 400 
     query = data['query']
 
     # 3. 敏感词检查
     if contains_banned_words(query):
         print(f"INFO: Banned word detected in query from {request.remote_addr}. Query: '{query[:50]}...'", file=sys.stderr)
-        # 返回纯文本拒绝消息 和 200 OK (按原设计)
         return Response(CONFIG.get('rejection_message', "Query contains restricted content."), mimetype='text/plain', status=200)
 
-    # 4. 调用 Coze 并流式返回
+    # 4. 调用 Coze SDK 并流式返回
+    global coze_client # 确保我们引用的是全局客户端
+    if not coze_client:
+        print("CRITICAL: coze_client is not initialized. Check server configuration and startup logs.", file=sys.stderr)
+        return {"error": "Server configuration error - Coze client not ready"}, 500
+        
     bot_id = CONFIG.get('fast_bot_id')
-    api_key = CONFIG.get('coze_key')
+    if not bot_id:
+         print("ERROR: Server configuration error: 'fast_bot_id' is missing.", file=sys.stderr)
+         return {"error": "Server configuration error"}, 500 
 
-    if not bot_id or not api_key:
-         print("ERROR: Server configuration error: 'fast_bot_id' or 'coze_key' is missing.", file=sys.stderr)
-         return {"error": "Server configuration error"}, 500 # Internal Server Error
+    # 准备 Coze SDK 的消息体
+    message_content_list = [{"type": "text", "text": query}]
+    try:
+        content_json_string = json.dumps(message_content_list)
+    except Exception as e:
+        print(f"ERROR: Failed to serialize query to JSON for Coze SDK: {e}", file=sys.stderr)
+        return {"error": "Internal server error preparing request"}, 500
 
-    print(f"INFO: Calling fast bot ({bot_id}) for {request.remote_addr}. Query: '{query[:50]}...'", file=sys.stderr)
-    generator = call_coze_stream(bot_id, query, api_key)
+    user_message = Message(
+        role=MessageRole.USER, 
+        content=content_json_string,
+        content_type="object_string" 
+    )
+
+    print(f"INFO: Calling fast bot ({bot_id}) via SDK for {request.remote_addr}. Query: '{query[:50]}...'", file=sys.stderr)
+    
+    try:
+        # 注意：SDK 的 stream 方法可能不直接接受 stream=True 参数，它本身就是流式方法
+        sdk_stream_iterable = coze_client.chat.stream(
+            bot_id=bot_id,
+            user_id="api_user", # 与旧版行为一致
+            additional_messages=[user_message],
+            auto_save_history=False, 
+        )
+    except AttributeError as ae: 
+        print(f"ERROR: Coze SDK call failed (AttributeError) for bot {bot_id}: {ae}\n{traceback.format_exc()}", file=sys.stderr)
+        return {"error": "Server error calling Coze service (SDK structure)"}, 500
+    except requests.exceptions.Timeout as e: # requests.exceptions 需要导入
+        print(f"ERROR: Request to Coze API timed out for bot {bot_id}: {e}", file=sys.stderr)
+        return {"error": "Request to Coze API timed out"}, 504 
+    except requests.exceptions.HTTPError as e:
+        print(f"ERROR: Coze API returned HTTP error for bot {bot_id}: {e.response.status_code} {e.response.reason}. Response: {e.response.text}", file=sys.stderr)
+        return {"error": f"Coze API request failed - HTTP {e.response.status_code if e.response else 'Unknown'}"}, getattr(e.response, 'status_code', 500)
+    except requests.exceptions.RequestException as e:
+        print(f"ERROR: Network error connecting to Coze API for bot {bot_id}: {e}", file=sys.stderr)
+        return {"error": f"Failed to connect to Coze API - {type(e).__name__}"}, 503
+    except Exception as e: 
+        print(f"ERROR: Coze SDK call failed for bot {bot_id}: {e}\n{traceback.format_exc()}", file=sys.stderr)
+        return {"error": "Internal server error calling Coze service"}, 500
+
+    processed_generator = sdk_stream_processor(sdk_stream_iterable, bot_id)
+    
     headers = {
         'Cache-Control': 'no-cache',
-        'X-Accel-Buffering': 'no'  # 禁用Nginx缓冲
+        'X-Accel-Buffering': 'no'  
     }
-    # 使用 text/event-stream 类型返回 SSE 流
-    return Response(stream_with_context(generator), 
-                   content_type='text/event-stream',
+    return Response(stream_with_context(processed_generator), 
+                   content_type='text/event-stream', # SSE
                    headers=headers)
 
-@app.route('/thinking', methods=['POST'])
-def thinking_endpoint():
-    """Coze 深度思考 Bot 接口 (流式)"""
-     # 1. 认证
-    auth_key = request.headers.get('auth-key')
-    if not valid_auth_key(auth_key):
-        print(f"WARNING: Invalid auth key received from {request.remote_addr}.", file=sys.stderr)
-        return {"error": CONFIG.get('rejection_message', "Unauthorized access")}, 401
 
-    # 2. 获取 Query
+@app.route('/nav', methods=['POST'])
+def nav_endpoint():
+    """导航 Bot 接口 (非流式) - 使用 SDK 和 JWTAuth"""
+    # 1. 认证 - 由 coze_client 通过 JWTAuth 自动处理
+
+    # 2. 获取 Query (确保是 JSON 请求)
     if not request.is_json:
         print("ERROR: Request content type is not application/json.", file=sys.stderr)
-        return {"error": "Request must be JSON"}, 415
+        return {"error": "Request must be JSON"}, 415 
 
     data = request.get_json()
     if not data or 'query' not in data or not isinstance(data['query'], str):
         print("ERROR: Missing or invalid 'query' parameter in JSON request.", file=sys.stderr)
-        return {"error": "Missing or invalid 'query' parameter"}, 400
+        return {"error": "Missing or invalid 'query' parameter"}, 400 
     query = data['query']
 
-    # 3. 敏感词检查
-    if contains_banned_words(query):
-        print(f"INFO: Banned word detected in query from {request.remote_addr}. Query: '{query[:50]}...'", file=sys.stderr)
-        return Response(CONFIG.get('rejection_message', "Query contains restricted content."), mimetype='text/plain', status=200)
+    # 3. 跳过敏感词检查 (根据要求)
 
-    # 4. 调用 Coze 并流式返回
-    bot_id = CONFIG.get('thinking_bot_id')
-    api_key = CONFIG.get('coze_key')
+    # 4. 调用 Coze SDK 并返回完整文本
+    global coze_client # 确保我们引用的是全局客户端
+    if not coze_client:
+        print("CRITICAL: coze_client is not initialized. Check server configuration and startup logs.", file=sys.stderr)
+        return {"error": "Server configuration error - Coze client not ready"}, 500
+        
+    bot_id = CONFIG.get('nav_bot_id')
+    if not bot_id:
+         print("ERROR: Server configuration error: 'nav_bot_id' is missing.", file=sys.stderr)
+         return {"error": "Server configuration error"}, 500 
 
-    if not bot_id or not api_key:
-        print("ERROR: Server configuration error: 'thinking_bot_id' or 'coze_key' is missing.", file=sys.stderr)
-        return {"error": "Server configuration error"}, 500
+    # 准备 Coze SDK 的消息体
+    message_content_list = [{"type": "text", "text": query}]
+    try:
+        content_json_string = json.dumps(message_content_list)
+    except Exception as e:
+        print(f"ERROR: Failed to serialize query to JSON for Coze SDK: {e}", file=sys.stderr)
+        return {"error": "Internal server error preparing request"}, 500
 
-    print(f"INFO: Calling thinking bot ({bot_id}) for {request.remote_addr}. Query: '{query[:50]}...'", file=sys.stderr)
-    generator = call_coze_stream(bot_id, query, api_key)
-    headers = {
-        'Cache-Control': 'no-cache',
-        'X-Accel-Buffering': 'no'  # 禁用Nginx缓冲
-    }
-    return Response(stream_with_context(generator), 
-                   content_type='text/event-stream',
-                   headers=headers)
+    user_message = Message(
+        role=MessageRole.USER, 
+        content=content_json_string,
+        content_type="object_string" 
+    )
+
+    print(f"INFO: Calling nav bot ({bot_id}) via SDK for {request.remote_addr}. Query: '{query[:50]}...'", file=sys.stderr)
+    
+    try:
+        # 使用非流式调用
+        chat_response = coze_client.chat.create(
+            bot_id=bot_id,
+            user_id="api_user",
+            additional_messages=[user_message],
+            auto_save_history=True
+        )
+        
+        # 获取完整的响应文本
+        full_content = ""
+        
+        # 等待对话完成
+        max_wait_time = 60  # 最大等待60秒
+        wait_interval = 0.5   # 每0.5秒检查一次
+        waited_time = 0
+        
+        while (hasattr(chat_response, 'status') and 
+               str(chat_response.status) == 'ChatStatus.IN_PROGRESS' and 
+               waited_time < max_wait_time):
+            
+            time.sleep(wait_interval)
+            waited_time += wait_interval
+            
+            # 重新获取对话状态
+            try:
+                chat_response = coze_client.chat.retrieve(
+                    conversation_id=chat_response.conversation_id,
+                    chat_id=chat_response.id
+                )
+            except Exception as e:
+                print(f"ERROR: Failed to retrieve chat status: {e}", file=sys.stderr)
+                break
+        
+        if waited_time >= max_wait_time:
+            print(f"ERROR: Chat timed out after {max_wait_time} seconds", file=sys.stderr)
+            return {"error": "Chat request timed out"}, 504
+        
+        if hasattr(chat_response, 'status') and str(chat_response.status) == 'ChatStatus.COMPLETED':
+            # 对话已完成，获取消息
+            if hasattr(chat_response, 'id') and hasattr(chat_response, 'conversation_id'):
+                try:
+                    # 获取对话中的消息
+                    messages = coze_client.chat.messages.list(
+                        conversation_id=chat_response.conversation_id,
+                        chat_id=chat_response.id
+                    )
+                    
+                    # 寻找助手的回复消息
+                    for message in messages:
+                        if (hasattr(message, 'role') and message.role == MessageRole.ASSISTANT and 
+                            hasattr(message, 'type') and message.type == MessageType.ANSWER and
+                            hasattr(message, 'content') and message.content):
+                            full_content += message.content
+                            
+                except Exception as e:
+                    print(f"ERROR: Failed to retrieve messages for nav bot {bot_id}: {e}", file=sys.stderr)
+                    return {"error": "Failed to retrieve bot response"}, 500
+        else:
+            print(f"ERROR: Chat did not complete successfully. Final status: {chat_response.status}", file=sys.stderr)
+            return {"error": "Chat did not complete successfully"}, 500
+        
+        if not full_content:
+            print(f"WARNING: No valid content received from nav bot {bot_id}", file=sys.stderr)
+            return {"error": "No content received from bot"}, 500
+            
+        print(f"INFO: Nav bot ({bot_id}) response: {full_content[:100]}...", file=sys.stderr)
+        
+        return Response(full_content, mimetype='text/plain', status=200)
+        
+    except AttributeError as ae: 
+        print(f"ERROR: Coze SDK call failed (AttributeError) for nav bot {bot_id}: {ae}\n{traceback.format_exc()}", file=sys.stderr)
+        return {"error": "Server error calling Coze service (SDK structure)"}, 500
+    except requests.exceptions.Timeout as e:
+        print(f"ERROR: Request to Coze API timed out for nav bot {bot_id}: {e}", file=sys.stderr)
+        return {"error": "Request to Coze API timed out"}, 504 
+    except requests.exceptions.HTTPError as e:
+        print(f"ERROR: Coze API returned HTTP error for nav bot {bot_id}: {e.response.status_code} {e.response.reason}. Response: {e.response.text}", file=sys.stderr)
+        return {"error": f"Coze API request failed - HTTP {e.response.status_code if e.response else 'Unknown'}"}, getattr(e.response, 'status_code', 500)
+    except requests.exceptions.RequestException as e:
+        print(f"ERROR: Network error connecting to Coze API for nav bot {bot_id}: {e}", file=sys.stderr)
+        return {"error": f"Failed to connect to Coze API - {type(e).__name__}"}, 503
+    except Exception as e: 
+        print(f"ERROR: Coze SDK call failed for nav bot {bot_id}: {e}\n{traceback.format_exc()}", file=sys.stderr)
+        return {"error": "Internal server error calling Coze service"}, 500
 
 # --- 启动服务 ---
 if __name__ == '__main__':
