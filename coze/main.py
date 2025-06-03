@@ -41,7 +41,7 @@ def load_config():
         with open('config.json', 'r', encoding='utf-8') as config_file:
             CONFIG = json.load(config_file)
             # 检查必要的配置是否存在
-            required_keys = ['auth_keys', 'fast_bot_id', 'nav_bot_id', 'rejection_message'] # 添加nav_bot_id到必须项
+            required_keys = ['auth_keys', 'fast_bot_id', 'rejection_message'] 
             for key in required_keys:
                 if key not in CONFIG:
                     raise ValueError(f"Config file 'config.json' is missing required key: {key}")
