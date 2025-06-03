@@ -7,6 +7,7 @@ import traceback
 import sys 
 import logging
 import time
+import re
 
 # 从 cozepy 导入必要的类
 from cozepy import (
@@ -138,6 +139,64 @@ def contains_banned_words(query):
         return False
     return any(banword in query for banword in BANWORDS)
 
+def clean_markdown(text):
+    """清除文本中的 markdown 格式符号"""
+    if not isinstance(text, str):
+        return text
+    
+    # 清除常见的 markdown 格式符号
+    # 标题符号 (#)
+    text = re.sub(r'^#+\s*', '', text, flags=re.MULTILINE)
+    
+    # 更积极地清除所有星号相关的格式
+    # 先处理标准的粗体和斜体格式
+    text = re.sub(r'\*\*([^*]+)\*\*', r'\1', text)  # **粗体**
+    text = re.sub(r'__([^_]+)__', r'\1', text)      # __粗体__
+    text = re.sub(r'\*([^*]+)\*', r'\1', text)      # *斜体*
+    text = re.sub(r'_([^_]+)_', r'\1', text)        # _斜体_
+    
+    # 清除残留的单独星号（包括不匹配的情况）
+    text = re.sub(r'\*+', '', text)  # 清除所有连续的星号
+    text = re.sub(r'_+', '', text)   # 清除所有连续的下划线
+    
+    # 删除线 (~~)
+    text = re.sub(r'~~([^~]+)~~', r'\1', text)
+    text = re.sub(r'~+', '', text)   # 清除残留的波浪号
+    
+    # 代码块 (```)
+    text = re.sub(r'```[^`]*```', '', text, flags=re.DOTALL)
+    
+    # 内联代码 (`)
+    text = re.sub(r'`([^`]+)`', r'\1', text)
+    text = re.sub(r'`+', '', text)   # 清除残留的反引号
+    
+    # 链接 [text](url)
+    text = re.sub(r'\[([^\]]+)\]\([^\)]+\)', r'\1', text)
+    
+    # 图片 ![alt](url)
+    text = re.sub(r'!\[([^\]]*)\]\([^\)]+\)', r'\1', text)
+    
+    # 引用 (>)
+    text = re.sub(r'^>\s*', '', text, flags=re.MULTILINE)
+    
+    # 列表符号 (-, +, *)
+    text = re.sub(r'^[-+*]\s*', '', text, flags=re.MULTILINE)
+    
+    # 有序列表 (1. 2. 等)
+    text = re.sub(r'^\d+\.\s*', '', text, flags=re.MULTILINE)
+    
+    # 表格分隔符 (|)
+    text = re.sub(r'\|', ' ', text)
+    
+    # 水平分割线 (---, ***)
+    text = re.sub(r'^[-*]{3,}\s*$', '', text, flags=re.MULTILINE)
+    
+    # 清理多余的空白字符
+    text = re.sub(r'\s+', ' ', text)
+    text = text.strip()
+    
+    return text
+
 # 新的 SDK 流处理器
 def sdk_stream_processor(sdk_stream, bot_id: str):
     """处理来自 Coze SDK 的流并产生内容部分。"""
@@ -150,7 +209,8 @@ def sdk_stream_processor(sdk_stream, bot_id: str):
                    event.message.role == MessageRole.ASSISTANT and \
                    event.message.type == MessageType.ANSWER and \
                    event.message.content:
-                    content_part = event.message.content
+                    # 清理响应内容中的 markdown 格式
+                    content_part = clean_markdown(event.message.content)
                     full_content_for_logging.append(content_part)
                     yield content_part
             elif event.event == ChatEventType.ERROR:
